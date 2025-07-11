@@ -1,0 +1,102 @@
+# Action Plan: Building a Personal AI & Coding/Engineering Agent
+
+## High-Level System Architecture
+
+The agent is organized as a set of cooperating layers:
+
+1. **Frontend** – Next.js/React chat UI sends user prompts and streams responses.  
+2. **API Layer** – Normalizes HTTP/WebSocket traffic into internal messages.  
+3. **Orchestrator** – A LangGraph graph in which every LangChain primitive (chains, agents, tool calls, memory read/writes) is modeled as a node and edges encode control-flow, including recursion and branching [LangGraph - LangChain](https://www.langchain.com/langgraph) .  
+4. **Specialized Agents** – Nodes hosting LLM-reasoning loops or execution logic (shell, Git, CI, etc.).  
+5. **Tools** – Encapsulated capabilities (Docker CLI, KiCad CLI, n8n web-hooks, Playwright, etc.) invoked by agent nodes.  
+6. **Memory** –  
+   • Graphiti sub-graph per chat session captures temporally-aware facts, messages, and entities [GitHub - getzep/graphiti: Build Real-Time Knowledge Graphs for AI Agents](https://github.com/getzep/graphiti)  [Graphiti: Knowledge Graph Memory for an Agentic World](https://neo4j.com/blog/developer/graphiti-knowledge-graph-memory/) .  
+   • Git repo snapshots serialized graph files for long-term, versioned storage; commit on pause or at checkpoints (implementation detail remains open—see §4).  
+7. **Execution Sandbox** – Full Linux VM with nested virtualization enabled so Docker-in-Docker is possible; created with `virt-install` on KVM hosts that load `kvm_intel nested=1` or `kvm_amd nested=1` [Installing Docker on a Virtual (KVM) Debian Bookworm - Medium](https://medium.com/@leigh_93150/debian-homepageinstalling-docker-on-a-virtual-kvm-debian-bookworm-26ed0806d230) .  
+8. **Automation & Scheduling** – n8n workflows triggered by the built-in Schedule Trigger node drive periodic jobs or self-invocation [Scheduling the workflow | n8n Docs](https://docs.n8n.io/courses/level-one/chapter-5/chapter-5.7/)  [How to Self-Host n8n with Docker Compose (And When You Shouldn’t)](https://code-boost.com/n8n-docker-compose/) .  
+9. **Observability** – LangGraph `astream_events` for live event streams [how to custom stream events in langgraph - Stack Overflow](https://stackoverflow.com/questions/79179756/how-to-custom-stream-events-in-langgraph) , Langfuse callback handler for full LLM-trace capture [Open Source Observability for LangGraph - Langfuse](https://langfuse.com/docs/integrations/langchain/example-python-langgraph) , or OpenTelemetry export via LangSmith SDK [Introducing End-to-End OpenTelemetry Support in LangSmith](https://blog.langchain.com/end-to-end-opentelemetry-langsmith/) .
+
+## Component-by-Component Design
+
+### Orchestrator / Agent Framework
+
+The task graph is built in LangGraph; recursion is achieved by connecting an agent’s output edge back to its input until a stop node asserts a termination condition [LangGraph - LangChain](https://www.langchain.com/langgraph) . A dedicated “Model-Router” decision node inspects task metadata and selects an LLM wrapper dynamically (see table in §2.2). MCP context is injected at every node so tools receive the same request metadata; nodes can emit MCP signals that branch execution accordingly [LangGraph - LangChain](https://www.langchain.com/langgraph) .
+
+### LLM Routing Layer
+
+*Table 1: Task-to-Model Mapping and Expected Runtime Characteristics [Multi-LLM routing strategies for generative AI applications on AWS](https://aws.amazon.com/blogs/machine-learning/multi-llm-routing-strategies-for-generative-ai-applications-on-aws/)  [Run models locally | ️ LangChain](https://python.langchain.com/docs/how_to/local_llms/) *
+
+| Task Type                            | Preferred Model(s)           | Access Method                     | Expected Latency                                                                                                                                                                                 | Expected $/1 k tokens                                                                                                                                                                                              |
+| ------------------------------------ | ---------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Prompt classification (LLM assisted) | Amazon Titan Text G1 Express | Bedrock API                       | ≈ 0.54 s [Multi-LLM routing strategies for generative AI applications on AWS](https://aws.amazon.com/blogs/machine-learning/multi-llm-routing-strategies-for-generative-ai-applications-on-aws/) | $0.0002 in/out [Multi-LLM routing strategies for generative AI applications on AWS](https://aws.amazon.com/blogs/machine-learning/multi-llm-routing-strategies-for-generative-ai-applications-on-aws/)             |
+| Prompt classification (semantic)     | Amazon Titan Embeddings V2   | Bedrock API + FAISS               | ≈ 0.10 s [Multi-LLM routing strategies for generative AI applications on AWS](https://aws.amazon.com/blogs/machine-learning/multi-llm-routing-strategies-for-generative-ai-applications-on-aws/) | $0.00002 in/out [Multi-LLM routing strategies for generative AI applications on AWS](https://aws.amazon.com/blogs/machine-learning/multi-llm-routing-strategies-for-generative-ai-applications-on-aws/)            |
+| Simple answer generation             | Claude 3 Haiku               | Bedrock API                       | ≈ 0.25 s [Multi-LLM routing strategies for generative AI applications on AWS](https://aws.amazon.com/blogs/machine-learning/multi-llm-routing-strategies-for-generative-ai-applications-on-aws/) | $0.00025 in / $0.00125 out [Multi-LLM routing strategies for generative AI applications on AWS](https://aws.amazon.com/blogs/machine-learning/multi-llm-routing-strategies-for-generative-ai-applications-on-aws/) |
+| Complex code/engineering reasoning   | Claude 3.5 Sonnet            | Bedrock API                       | ≈ 2.3 s [Multi-LLM routing strategies for generative AI applications on AWS](https://aws.amazon.com/blogs/machine-learning/multi-llm-routing-strategies-for-generative-ai-applications-on-aws/)  | $0.003 in / $0.015 out [Multi-LLM routing strategies for generative AI applications on AWS](https://aws.amazon.com/blogs/machine-learning/multi-llm-routing-strategies-for-generative-ai-applications-on-aws/)     |
+| Private/lightweight tasks            | Local HF model (e.g., Llama) | Transformers Pipeline (localhost) | HW-dependent [Run models locally                                                                                                                                                                 | ️ LangChain](https://python.langchain.com/docs/how_to/local_llms/)                                                                                                                                                 | n/a |
+
+### Memory & Persistence
+
+In-process short-term context resides in LangGraph state. Persistent facts are written to the Graphiti sub-graph for the current session UUID [GitHub - getzep/graphiti: Build Real-Time Knowledge Graphs for AI Agents](https://github.com/getzep/graphiti) . When a session is paused, the sub-graph is exported to JSON and committed to Git to enable later rollback—Graphiti currently exposes no official exporter, so a custom serializer is required (open item, see §4) [Installing Docker on a Virtual (KVM) Debian Bookworm - Medium](https://medium.com/@leigh_93150/debian-homepageinstalling-docker-on-a-virtual-kvm-debian-bookworm-26ed0806d230) .
+
+### Execution Sandbox
+
+A Debian/Ubuntu VM is provisioned via `virt-install`, ensuring nested virtualization (`nested=1`) so Docker-in-Docker works [Installing Docker on a Virtual (KVM) Debian Bookworm - Medium](https://medium.com/@leigh_93150/debian-homepageinstalling-docker-on-a-virtual-kvm-debian-bookworm-26ed0806d230) . Inside the VM, the privileged `docker:stable-dind` container is launched for isolated build and test jobs. Headless browser actions run via Playwright installed in the VM (Node 18 + `npm i -D playwright`; dependencies include `libnss3`, `libatk1.0-0`, `libgtk-3-0`, etc.) [Installing Docker on a Virtual (KVM) Debian Bookworm - Medium](https://medium.com/@leigh_93150/debian-homepageinstalling-docker-on-a-virtual-kvm-debian-bookworm-26ed0806d230) . Terminal I/O is captured by streaming container STDOUT and piping commands through `docker exec -i` for programmatic control.
+
+### Tooling Integrations
+
+**n8n** is used with the Schedule Trigger for cron-like automation; it is self-hosted via `docker-compose` with volume-mounted `./n8n-data` for persistence [Scheduling the workflow | n8n Docs](https://docs.n8n.io/courses/level-one/chapter-5/chapter-5.7/)  [How to Self-Host n8n with Docker Compose (And When You Shouldn’t)](https://code-boost.com/n8n-docker-compose/) . MCP is implemented as local JSON-RPC 2.0 servers over STDIO; logs are sent to `stderr` and signals are handled for clean shutdown [STDIO Transport - MCP Framework](https://mcp-framework.com/docs/Transports/stdio-transport/) . Engineering CLIs include KiCad board export (`kicad-cli pcb export gerbers board.kicad_pcb`) [KiCad Command-Line Interface | 7.0 | English | Documentation | KiCad](https://docs.kicad.org/7.0/en/cli/cli.html) , Docker orchestration commands (`docker run`, `docker build`, `docker ps`, etc.) [Installing Docker: A Step-by-Step Guide - IOCoding](https://iocoding.com/blog/installing-docker-a-step-by-step-guide/) , and compilers such as GCC with flags like `-Wall -O2 -g` or `-S -save-temps` for diagnostics [15 Most Frequently Used GCC Compiler Command Line Options](https://www.thegeekstuff.com/2012/10/gcc-compiler-options/) ; MSVC is used via `cl /EHsc` after running `vcvarsall.bat` [Use the Microsoft C++ toolset from the command line](https://learn.microsoft.com/en-us/cpp/build/building-on-the-command-line?view=msvc-170) .
+
+### Front-End
+
+The front-end starts from Vercel’s `ai-chatbot` Next.js template [A full-featured, hackable Next.js AI chatbot built by Vercel](https://github.com/vercel/ai-chatbot) . The shadcn/ui component library is added for ready-made, accessible UI primitives [React + Shadcn UI Preview](https://reactshadcn.com/) . File upload and download are enabled through UploadThing React hooks [UploadThing: A Modern File Upload Solution for Next.js Applications](https://www.harshalranjhani.in/blog/uploadthing-a-modern-file-upload-solution-for-nextjs-applications) , with inline image previews shown using the FileReader pattern [Next.js Image File Upload and Preview with shadcn/ui](https://frontendshape.com/post/nextjs-image-file-upload-and-preview-with-shadcn-ui) . If file upload is a priority from day one, Jayptrp’s `nextjs-ai-chatbot-file-upload` can be forked instead [Jayptrp/nextjs-ai-chatbot-file-upload - GitHub](https://github.com/Jayptrp/nextjs-ai-chatbot-file-upload) .
+
+### Debugging & Observability
+
+*Table 2: Free / OSS Logging & Tracing Options*
+
+| Stack                                                                                                                                                                         | Setup Complexity | Resource Footprint | Strengths                                       | Limitations                              |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- | ------------------ | ----------------------------------------------- | ---------------------------------------- |
+| LangGraph `astream_events` [how to custom stream events in langgraph - Stack Overflow](https://stackoverflow.com/questions/79179756/how-to-custom-stream-events-in-langgraph) | Very low         | Minimal            | Real-time event stream; no extra infrastructure | Raw JSON stream only                     |
+| Langfuse self-host [Open Source Observability for LangGraph - Langfuse](https://langfuse.com/docs/integrations/langchain/example-python-langgraph)                            | Moderate         | Low (self-host)    | LLM-specific traces, prompt CMS                 | Requires running DB & UI                 |
+| OpenTelemetry + LangSmith SDK [Introducing End-to-End OpenTelemetry Support in LangSmith](https://blog.langchain.com/end-to-end-opentelemetry-langsmith/)                     | Low              | Variable           | Vendor-neutral OpenTelemetry ecosystem          | Less rich LLM metadata unless customized |
+| Agenta SDK [Observability for LangGraph with Agenta - Docs - Agenta](https://docs.agenta.ai/observability/integrations/langgraph)                                             | Low              | Low                | No-code UI for LangGraph apps                   | Cloud account or self-host               |
+| MLflow GenAI autolog() [Tracing LangGraph ️ - MLflow](https://mlflow.org/docs/latest/genai/tracing/integrations/listing/langgraph)                                             | Very low         | Low                | Zero-instrumentation, MLflow tracking           | Basic graph visualization                |
+
+### Multi-Chat Session Handling
+
+A stateless session router issues Version-4 UUIDs for new chats and forwards the UUID with every request [uuid - Best practices for SessionId/Authentication Token generation ...](https://stackoverflow.com/questions/5244455/best-practices-for-sessionid-authentication-token-generation) . Graphiti hosts one sub-graph per UUID, storing messages, entities, and temporal edges [Graphiti: Knowledge Graph Memory for an Agentic World](https://neo4j.com/blog/developer/graphiti-knowledge-graph-memory/) . Snapshot logic serializes the sub-graph to `<repo>/<uuid>/state.json` and commits it, allowing later checkout and re-import.
+
+### Deployment Targets
+
+Exact VM size, cloud provider, and OSS UI template remain open design decisions [Virtual machine sizes overview - Azure Virtual Machines](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/overview)  [Top 11 Open Source Design Systems - DEV Community](https://dev.to/litlyx/top-11-open-source-design-systems-1m70) . Provisioning parity across targets is expected to use infrastructure-as-code, with the tooling choice also open.
+
+## Step-by-Step Roadmap
+
+*Table 3: Phase Plan (effort placeholders marked “TBD” – estimation still open)*
+
+| Phase | Goal(s)                                   | Core Deliverable                                      | Effort | Notes                                                                                                                                                         |
+| ----- | ----------------------------------------- | ----------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0     | Environment preparation & VM provisioning | KVM/Proxmox/AWS VM with nested virtualization enabled | TBD    | Size and cloud choice open [Virtual machine sizes overview - Azure Virtual Machines](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/overview) |
+| 1     | Minimal chat UI + Claude agent            | Next.js UI + LangChain call to Claude Haiku           | TBD    |                                                                                                                                                               |
+| 2     | Add Graphiti memory layer                 | Sub-graph CRUD via LangChain tool                     | TBD    |                                                                                                                                                               |
+| 3     | Introduce MCP tool calls                  | STDIO server for shell execution                      | TBD    |                                                                                                                                                               |
+| 4     | Add model-routing logic                   | LangGraph router node (Table 1)                       | TBD    |                                                                                                                                                               |
+| 5     | Integrate n8n scheduler                   | Self-host n8n, Schedule Trigger                       | TBD    |                                                                                                                                                               |
+| 6     | Expand toolset                            | KiCad, Docker, Playwright tools                       | TBD    |                                                                                                                                                               |
+| 7     | Git-based memory snapshots                | Export/import graph → Git commits                     | TBD    | Custom serializer required                                                                                                                                    |
+| 8     | Hardening & scaling                       | Observability stack (Table 2), backups                | TBD    |                                                                                                                                                               |
+| 9     | Self-improvement loop                     | Agent tasks to refactor its own code                  | TBD    |                                                                                                                                                               |
+
+## Open Items / Flexible Decisions
+
+| Area                                                       | Status                                          | Reference                                                                                                                                                                       |
+| ---------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Exact VM series / cloud instance size                      | Open – choose based on budget and latency needs | [Virtual machine sizes overview - Azure Virtual Machines](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/overview)                                              |
+| UI component library (Tailwind vs Chakra vs Ant)           | Open                                            | [Top 11 Open Source Design Systems - DEV Community](https://dev.to/litlyx/top-11-open-source-design-systems-1m70)                                                               |
+| Graphiti → JSON exporter implementation                    | Open – no official support yet                  | [Installing Docker on a Virtual (KVM) Debian Bookworm - Medium](https://medium.com/@leigh_93150/debian-homepageinstalling-docker-on-a-virtual-kvm-debian-bookworm-26ed0806d230) |
+| Timeline & effort estimates                                | Open – placeholders in Table 3                  | (derived from open status)                                                                                                                                                      |
+| Choice of infrastructure-as-code (Ansible vs DevContainer) | Open                                            | Not yet documented with idx                                                                                                                                                     |
+
+---
+
+Follow this architecture-first plan, filling the open items with team-specific choices and estimates, to incrementally assemble the ultimate personal AI coding and engineering agent.

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "graphiti-memory": {
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "http://localhost:10001/sse"
+      ],
+      "env": {}
+    }
+  }
+}
